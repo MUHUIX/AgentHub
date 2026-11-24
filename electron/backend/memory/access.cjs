@@ -122,6 +122,19 @@ class AgentAccess {
    *  但配置里指的还是旧名字，不收敛的话下次升级仍会被 NSIS 的映像名判定挡住。 */
   convergeHost(cfgAgents) {
     const changed = [];
+    // 只收敛「宿主住在安装目录里」的旧形态（含最早期直接用主程序 exe 的写法），
+    // 用户手改成安装目录之外的命令不碰。
+    const instDir = this.appPath ? path.resolve(path.dirname(this.appPath)) : "";
+    const isOldHostPath = (p) => {
+      if (!p) return false;
+      try {
+        const full = path.resolve(p);
+        if (this.appPath && full === path.resolve(this.appPath)) return true;
+        return !!instDir && path.dirname(full) === instDir;
+      } catch {
+        return false;
+      }
+    };
     try {
       for (const adapter of agents.list(cfgAgents)) {
         if (adapter.format !== "yml-cordis-patch") continue;
@@ -135,7 +148,7 @@ class AgentAccess {
         if (current) {
           if (current === desired) continue;
           // 只收敛「宿主就是主程序」这一种旧形态，其余差异留给用户
-          if (!/AgentHub\.exe$/i.test(current)) continue;
+          if (!isOldHostPath(current)) continue;
           const r = this.injectOne(adapter.id, cfgAgents);
           changed.push({ id: adapter.id, ok: !!r.ok, from: current, to: desired, message: r.message || "" });
           continue;
@@ -143,7 +156,7 @@ class AgentAccess {
         // 受控块之前的旧版插入块：同样指为主程序，只改它的 command 一行
         const legacy = inject.legacyCordisCommand(adapter);
         if (!legacy || legacy === desired) continue;
-        if (!/AgentHub\.exe$/i.test(legacy)) continue;
+        if (!isOldHostPath(legacy)) continue;
         const r = inject.rewriteLegacyCordisCommand(adapter, desired);
         changed.push({ id: adapter.id, ok: !!r.ok, from: legacy, to: desired, message: r.message || r.action || "" });
       }
