@@ -55,48 +55,129 @@ function resolveHostExe(appPath) {
   return appPath || null;
 }
 
-// MCP 宿主进程名必须与主程序**不同名**。
+// MCP 宿主进程名必须与主程序**不同名**，且**不能住在安装目录里**。两条缺一不可。
 //
-// 为什么：electron-builder 的 NSIS 安装/卸载阶段按「映像名」（AgentHub.exe）判定应用是否仍在运行，
-// 不看路径也不看命令行。而记忆中枢的 MCP 桥是常驻进程——DSH / Cursor / Claude 等客户端长期持有它。
-// 若它用主程序 exe 启动，就会出现：应用自己「重启并更新」时主进程已干净退出（crash.log 有
-// `quit exitCode=0`），安装器却因为还挂着一个同名但不同用途的 MCP 子进程而拒绝卸载旧文件，
-// 弹出「Failed to uninstall old application files. Please try running the installer again.: 2」，
-// 升级永远装不上。给它一个独立名字，动作照旧，判定不再撞车。
+// ① 同名：electron-builder 的 NSIS 安装/卸载阶段按「映像名」（AgentHub.exe）判定应用是否仍在运行，
+//    不看路径也不看命令行。MCP 桥是常驻进程（DSH / Cursor / Claude 长期持有），若它用主程序 exe
+//    启动，升级时主进程虽已干净退出（crash.log 有 `quit exitCode=0`），安装器仍会因为"同名进程在跑"
+//    而拒绝卸载。
+// ② 同目录：即使换了名字，只要宿主 exe 还躺在 INSTDIR 里，运行中的它对
+//    `AgentHub.exe` / `icudtl.dat` / `v8_context_snapshot.bin` 持有映像锁。NSIS 卸载遍历安装目录时
+//    删不掉这些文件，会留下残留，新安装器随后报
+//    「Failed to uninstall old application files. Please try running the installer again.: 2」。
+//    实测：卸载器本身返回 0，但目录里正好剩这 3 个被锁文件。
+//
+// 结论：宿主必须放在安装目录之外的独立运行目录里，进程名也用 agenthub-mcp.exe。
 const MCP_HOST_BASENAME = "agenthub-mcp";
+// Electron 以 ELECTRON_RUN_AS_NODE 跑脚本时仍需从 exe 同目录读这两份数据文件（缺 icudtl.dat 会
+// 报 "Invalid file descriptor to ICU data received" 且脚本不执行）。
+const MCP_HOST_DATA_FILES = ["icudtl.dat", "v8_context_snapshot.bin"];
 
-/** 与主程序同内容、不同名字的 MCP 宿主可执行路径（仅 Windows 需要，其余平台原样返回）。 */
+/** 同一份文件？硬链接看 inode，复制件退回 size+mtime。 */
+function sameFile(srcStat, dstPath) {
+  try {
+    const cur = fs.statSync(dstPath);
+    return cur.ino === srcStat.ino && cur.size === srcStat.size && cur.mtimeMs === srcStat.mtimeMs;
+  } catch {
+    return false;
+  }
+}
+
+/** 把 src 备到 dst：先试硬链接（同卷零拷贝），失败退复制。成功返回 true。 */
+function linkOrCopy(src, dst) {
+  if (fs.existsSync(dst)) return true;
+  try {
+    fs.linkSync(src, dst);
+    return true;
+  } catch {
+    try {
+      fs.copyFileSync(src, dst);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/** 宿主运行根目录：优先与安装目录**同卷的兄弟目录**（可硬链接、零拷贝），
+ *  父目录不可写时退回 userData。两者都在 INSTDIR 之外。 */
+function mcpHostRoot(appPath) {
+  const instDir = path.dirname(appPath);
+  const sibling = path.join(path.dirname(instDir), `${path.basename(instDir)}-runtime`);
+  try {
+    fs.mkdirSync(sibling, { recursive: true });
+    // 探一下真能写（Program Files 下无权限时 mkdir 可能已被创建但写文件会失败）
+    const probe = path.join(sibling, `.w`);
+    fs.writeFileSync(probe, "");
+    fs.rmSync(probe, { force: true });
+    return sibling;
+  } catch { /* 退回 userData */ }
+  try {
+    const fallback = path.join(process.env.APPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Roaming"), "AgentHub", "mcp-host");
+    fs.mkdirSync(fallback, { recursive: true });
+    return fallback;
+  } catch {
+    return null;
+  }
+}
+
+/** 清掉运行目录里除 keep 之外的旧版本子目录（旧宿主可能仍在跑，删不掉就留给下次）。 */
+function pruneHostVersions(root, keep) {
+  try {
+    for (const name of fs.readdirSync(root)) {
+      if (name === keep) continue;
+      const p = path.join(root, name);
+      let st;
+      try { st = fs.statSync(p); } catch { continue; }
+      if (!st.isDirectory()) continue;
+      try {
+        for (const f of fs.readdirSync(p)) {
+          try { fs.unlinkSync(path.join(p, f)); } catch { /* 被占用：下次再清 */ }
+        }
+        fs.rmdirSync(p);
+      } catch { /* 同上 */ }
+    }
+  } catch { /* 清理失败不影响接入 */ }
+}
+
+/** 与主程序同内容、独立名字、**独立目录**的 MCP 宿主可执行路径（仅 Windows 需要，其余平台原样返回）。 */
 function resolveMcpHostExe(appPath) {
   if (!appPath || process.platform !== "win32") return appPath;
   if (!/\.exe$/i.test(appPath) || !fs.existsSync(appPath)) return appPath;
-  const dst = path.join(path.dirname(appPath), `${MCP_HOST_BASENAME}.exe`);
+  const legacydst = path.join(path.dirname(appPath), `${MCP_HOST_BASENAME}.exe`); // ① 之前的落地位置（INSTDIR 内）
   try {
     const src = fs.statSync(appPath);
-    if (fs.existsSync(dst)) {
-      const cur = fs.statSync(dst);
-      // 同 inode 即同一份文件（硬链接），无需重建；应用升级换过主程序后 inode 变化
-      if (cur.ino === src.ino && cur.size === src.size) return dst;
-      try {
-        fs.unlinkSync(dst);
-      } catch {
-        // 旧宿主正被 MCP 客户端占用（指向运行中映像的链接删不掉，EPERM）：
-        // 它仍是能跑 Node 的同一套 Electron，继续用旧链接比另造新名字更干净，
-        // 等旧进程退出后下一次启动会自行换成新主程序。
-        return dst;
-      }
+    // 版本键用主程序 size+mtime：每次升级/重装都会变，天然隔离新旧宿主，避免"运行中无法覆盖"。
+    const key = `${src.size}-${Math.round(src.mtimeMs)}`;
+    const root = mcpHostRoot(appPath);
+    if (!root) return legacyFallback(appPath, src, legacydst);
+    const dir = path.join(root, key);
+    fs.mkdirSync(dir, { recursive: true });
+    const dst = path.join(dir, `${MCP_HOST_BASENAME}.exe`);
+    if (!sameFile(src, dst)) {
+      // 版本目录是新的，正常不会撞锁；真撞了就说明同一版本被重装，退回旧落地位置
+      try { if (fs.existsSync(dst)) fs.unlinkSync(dst); } catch { return legacyFallback(appPath, src, legacydst); }
     }
-    try {
-      fs.linkSync(appPath, dst); // 同卷硬链接：毫秒级、零字节拷贝
-      return dst;
-    } catch {
-      // 跨卷 / 非 NTFS / 目录不可写：退回复制（慢但只发生一次）
-      try {
-        fs.copyFileSync(appPath, dst);
-        return dst;
-      } catch {
-        return appPath; // 都失败则保持旧行为，不阻断接入
-      }
+    if (!linkOrCopy(appPath, dst)) return legacyFallback(appPath, src, legacydst);
+    for (const name of MCP_HOST_DATA_FILES) {
+      const from = path.join(path.dirname(appPath), name);
+      if (fs.existsSync(from)) linkOrCopy(from, path.join(dir, name));
     }
+    pruneHostVersions(root, key);
+    return dst;
+  } catch {
+    try { return legacyFallback(appPath, fs.statSync(appPath), legacydst); } catch { return appPath; }
+  }
+}
+
+/** 兜底：仍放安装目录内（旧行为）。宁可升级受阻，也不能让记忆中枢接不上。 */
+function legacyFallback(appPath, srcStat, dst) {
+  try {
+    if (!sameFile(srcStat, dst)) {
+      try { if (fs.existsSync(dst)) fs.unlinkSync(dst); } catch { return dst; }
+      if (!linkOrCopy(appPath, dst)) return appPath;
+    }
+    return dst;
   } catch {
     return appPath;
   }
